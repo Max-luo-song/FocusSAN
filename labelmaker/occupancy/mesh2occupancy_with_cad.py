@@ -1,0 +1,598 @@
+import argparse
+import logging
+import os
+from pathlib import Path
+from typing import Union
+import gin
+import cv2
+import open3d as o3d
+import numpy as np
+import shutil
+
+from labelmaker.label_data import get_wordnet, get_occ11
+from tools import point_cloud_to_voxel_grid_unbounded
+from tqdm import tqdm
+from PIL import Image
+from sklearn.neighbors import KDTree
+import pickle
+from copy import deepcopy
+import math as m
+
+logging.basicConfig(level="INFO")
+log = logging.getLogger('Mesh2Occupancy')
+
+vis_debug = False
+
+import trimesh
+
+
+def voxelize_with_trimesh(mesh, voxel_size=0.05):
+    # 转换为Trimesh对象
+    tri_mesh = trimesh.Trimesh(
+        vertices=np.asarray(mesh.vertices),
+        faces=np.asarray(mesh.triangles)
+    )
+
+    # 水密体素化
+    voxels = tri_mesh.voxelized(
+        pitch=voxel_size,
+        method='subdivide'  # 确保水密性
+    )
+
+    return voxels.matrix, voxels.points  # 体素矩阵和中心坐标
+
+
+def Ry(theta):
+    return np.matrix([[m.cos(theta), 0, m.sin(theta)],
+                      [0, 1, 0],
+                      [-m.sin(theta), 0, m.cos(theta)]])
+
+
+def Rx(t):
+    """Rotation about the x-axis."""
+    c = np.cos(t)
+    s = np.sin(t)
+    return np.array([[1, 0, 0],
+                     [0, c, -s],
+                     [0, s, c]])
+
+
+def transform_ScanNet_to_py3D():
+    rot_tmp1 = Rx(np.deg2rad(-90))
+    rot_tmp2 = Ry(np.deg2rad(-90))
+    rot3 = np.asarray(np.dot(rot_tmp2, rot_tmp1))
+    T = np.eye(4)
+    T[:3, :3] = rot3
+    return T
+
+
+def alignPclMesh(pclMesh, axis_align_matrix=np.eye(4), T=np.eye(4)):
+    if isinstance(pclMesh, o3d.geometry.TriangleMesh):
+        verts = np.array(pclMesh.vertices)
+        newVerts = np.ones((verts.shape[0], 4))
+        newVerts[:, :3] = verts
+        newVerts = newVerts.dot(axis_align_matrix.T)
+        newVerts = newVerts.dot(T.T)
+        pclMesh.vertices = o3d.utility.Vector3dVector(newVerts[:, :3])
+    elif isinstance(pclMesh, o3d.geometry.PointCloud):
+        points = np.array(pclMesh.points)
+        newPoints = np.ones((points.shape[0], 4))
+        newPoints[:, :3] = points
+        newPoints = newPoints.dot(axis_align_matrix.T)
+        newPoints = newPoints.dot(T.T)
+        pclMesh.points = o3d.utility.Vector3dVector(newPoints[:, :3])
+    elif isinstance(pclMesh, np.ndarray):
+        points = pclMesh
+        newPoints = np.ones((points.shape[0], 4))
+        newPoints[:, :3] = points
+        newPoints = newPoints.dot(axis_align_matrix.T)
+        newPoints = newPoints.dot(T.T)
+        return newPoints
+        # pclMesh.points = o3d.utility.Vector3dVector(newPoints[:, :3])
+    else:
+        raise NotImplementedError
+
+    return pclMesh
+
+
+@gin.configurable
+def main(
+        scene_dir: Union[str, Path],
+        input_label: Union[str, Path],
+        input_mesh: Union[str, Path],
+        output_global_occupancy: Union[str, Path],
+        output_frame_folder: Union[str, Path],
+        cad_object_label: Union[str, Path],
+        original_object_index: Union[str, Path],
+        cad_retrieval_mesh: Union[str, Path],
+        label_space='occ11',
+        voxel_size=0.08,
+
+):
+    scene_dir = Path(scene_dir)
+    intput_label = Path(input_label)  #
+    input_mesh = Path(input_mesh)
+
+    cad_object_label = Path(cad_object_label)
+    original_object_index = Path(original_object_index)
+    cad_retrieval_mesh = Path(cad_retrieval_mesh)
+
+    output_global_occupancy = Path(output_global_occupancy)
+
+    # check if scene_dir exists
+    assert scene_dir.exists() and scene_dir.is_dir()
+
+    # define all paths
+    input_color_dir = scene_dir / 'color'
+    assert input_color_dir.exists() and input_color_dir.is_dir()
+
+    input_depth_dir = scene_dir / 'depth'
+    assert input_depth_dir.exists() and input_depth_dir.is_dir()
+
+    input_intrinsic_dir = scene_dir / 'intrinsic'
+    assert input_intrinsic_dir.exists() and input_intrinsic_dir.is_dir()
+
+    input_pose_dir = scene_dir / 'pose'
+    assert input_pose_dir.exists() and input_pose_dir.is_dir()
+
+    input_mesh_path = scene_dir / input_mesh
+    assert input_mesh_path.exists() and input_mesh_path.is_file()
+
+    input_label_path = scene_dir / intput_label
+    assert input_label_path.exists() and input_label_path.is_file()
+    #####
+    cad_object_label_path = scene_dir / cad_object_label
+    assert cad_object_label_path.exists() and cad_object_label_path.is_file()
+
+    original_object_index_path = scene_dir / original_object_index
+    assert original_object_index_path.exists() and original_object_index_path.is_file()
+
+    cad_retrieval_mesh_path = scene_dir / cad_retrieval_mesh
+    assert cad_retrieval_mesh_path.exists() and cad_retrieval_mesh_path.is_file()
+
+    output_dir = scene_dir / output_frame_folder
+    shutil.rmtree(output_dir, ignore_errors=True)  # remove output_dir if it exists
+    os.makedirs(str(output_dir), exist_ok=False)
+    ##########
+
+    # load mesh and extract colors
+    mesh = o3d.io.read_triangle_mesh(str(input_mesh_path))
+    vertices = np.asarray(mesh.vertices)  # (N,3)
+
+    # load the semantic label for each point
+    label_3d = np.loadtxt(str(input_label_path))  # (N,)
+
+    assert len(label_3d) == len(vertices)
+    fast_search_classes = ['bed', 'bench', 'chair', 'clock', 'display', 'flowerpot', 'guitar', 'lamp', 'laptop',
+                           'microwaves', 'piano', 'printer', 'sofa', 'stove', 'table', 'trash bin', 'washer']
+    fast_cad2occ = [
+        6,  # 'bed'
+        10,  # 'bench'
+        5,  # 'chair'
+        11,  # 'clock'
+        11,  # 'display'
+        11,  # 'flowerpot'
+        11,  # 'guitar'
+        11,  # 'lamp'
+        11,  # 'laptop
+        11,  # microwaves
+        11,  # piano
+        11,  # printer
+        7,  # sofa
+        11,  # 'stove'
+        8,  # table
+        10,  # 'trash bin
+        10,  # washer
+    ]
+    cad_original_object_index = np.loadtxt(str(original_object_index_path)).astype(int)
+    cad_retrieval_object_label = np.loadtxt(str(cad_object_label_path))
+    cad_retrieval_object_label = np.array(fast_cad2occ)[cad_retrieval_object_label.astype(int)]
+    # cad_retrieval_object_label = fast_cad2occ(cad_retrieval_object_label)
+    cad_retrieval_mesh = o3d.io.read_triangle_mesh(str(cad_retrieval_mesh_path))
+    transform_matrix = np.linalg.inv(transform_ScanNet_to_py3D())
+    cad_retrieval_mesh = alignPclMesh(cad_retrieval_mesh, transform_matrix)
+    # cad_retrieval_vertices = np.asarray(cad_retrieval_mesh.vertices)  # (N,3)
+
+    # 去除物体的扫描部分
+    label_3d = np.delete(label_3d, cad_original_object_index)
+    mesh.remove_vertices_by_index(cad_original_object_index)
+    bg_vertices = np.asarray(mesh.vertices)
+    bg_label_3d = label_3d
+    # 添加物体的CAD模型
+    ##################### CAD模型单独体素化
+    # 1. 先执行CAD模型的水密体素化
+    changes = np.where(cad_retrieval_object_label[:-1] != cad_retrieval_object_label[1:])[0] + 1
+    start_indices = np.concatenate([[0], changes])
+    end_indices = np.concatenate([changes, [len(cad_retrieval_object_label)]])
+
+    vertices = np.asarray(cad_retrieval_mesh.vertices)
+    triangles = np.asarray(cad_retrieval_mesh.triangles)
+    separate_meshes = []
+    for start, end in zip(start_indices, end_indices):
+        # 当前标签块的顶点范围
+        label = cad_retrieval_object_label[start]
+        vertex_indices = np.arange(start, end)
+
+        # 筛选完全属于当前块的三角形
+        mask = np.all(np.isin(triangles, vertex_indices), axis=1)
+        valid_triangles = triangles[mask] - start  # 重映射索引到0-based
+
+        # 创建独立模型
+        mesh_part = o3d.geometry.TriangleMesh()
+        mesh_part.vertices = o3d.utility.Vector3dVector(vertices[start:end])
+        mesh_part.triangles = o3d.utility.Vector3iVector(valid_triangles)
+        separate_meshes.append((label, mesh_part))  # 保存标签和模型
+
+    all_voxels = []
+    all_sem_labels = []
+    for label, mesh in separate_meshes:
+        # 方法二：使用Trimesh（更推荐） 执行水密体素化
+        voxel_matrix, centers = voxelize_with_trimesh(mesh, voxel_size)
+
+        all_voxels.append(centers)  # 存储每个模型的体素
+        all_sem_labels.append(np.array([label] * len(centers)))
+
+    # 合并所有体素
+    combined_voxels = np.vstack(all_voxels)
+    combined_sem_labels = np.concatenate(all_sem_labels)
+
+    # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
+    #     o3d.geometry.PointCloud(o3d.utility.Vector3dVector(combined_voxels)),
+    #     voxel_size=voxel_size
+    # )
+    # voxel_centers = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()]) * voxel_size
+    # cad_pcd = o3d.geometry.PointCloud()
+    # cad_pcd.points = o3d.utility.Vector3dVector(voxel_centers)
+    # o3d.io.write_point_cloud(str(scene_dir / 'CAD_model_points.ply'), cad_pcd)
+    # assert len(voxel_centers) == len(combined_sem_labels)
+    ##################### CAD模型单独体素化
+    # mesh = mesh + cad_retrieval_mesh
+    # label_3d = np.concatenate([label_3d, cad_retrieval_object_label])
+    #
+    # vertices = np.asarray(mesh.vertices)
+    scene_vertices = np.concatenate([bg_vertices, combined_voxels])
+    scene_label_3d = np.concatenate([bg_label_3d, combined_sem_labels])
+
+    assert len(scene_label_3d) == len(scene_vertices)
+    vertices = scene_vertices
+    label_3d = scene_label_3d
+    # debug
+    # tmp = o3d.io.write_triangle_mesh(
+    #     os.path.join("/home/chm/datasets/arkitscenes/labelmaker/47333462", "test.ply"),
+    #     mesh
+    # )
+
+    # define color map for visualization
+    num_classes = 2000
+    color_map = np.zeros(shape=(num_classes, 3), dtype=np.uint8)
+
+    if label_space == 'wordnet':
+        num_classes = len(get_wordnet())
+        for item in get_wordnet():
+            color_map[item['id']] = item['color']
+    elif label_space == 'occ11':
+        num_classes = len(get_occ11())
+        for item in get_occ11():
+            color_map[item['id']] = item['color']
+    else:
+        raise Exception(f'Unknown label space {label_space}')
+    ##############################
+    # generate global occupancy
+    ##############################
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(vertices)
+    o3d.io.write_point_cloud(str(scene_dir / 'pc.ply'), pcd)
+
+    voxel_down_pcd, _, inverse_index_list = pcd.voxel_down_sample_and_trace(
+        voxel_size=voxel_size, min_bound=pcd.get_min_bound(), max_bound=pcd.get_max_bound()
+    )
+
+    o3d.io.write_point_cloud(str(scene_dir / 'pc_voxel_down.ply'), voxel_down_pcd)
+
+    voxel_votes = np.zeros((len(voxel_down_pcd.points), num_classes), dtype=int)
+    all_indices = np.concatenate(inverse_index_list)
+    all_sem_labels = np.concatenate([np.full(len(indices), i) for i, indices in enumerate(inverse_index_list)])
+    sem_labels = label_3d[all_indices].astype(int)
+    np.add.at(voxel_votes, (all_sem_labels, sem_labels), 1)
+    voxel_sem = np.argmax(voxel_votes, axis=1)
+
+    valid_point_mask = voxel_sem > 0
+    voxel_down_pcd.points = o3d.utility.Vector3dVector(np.asarray(voxel_down_pcd.points)[valid_point_mask, :])
+    voxel_down_pcd.colors = o3d.utility.Vector3dVector(color_map[voxel_sem[valid_point_mask]] / 255)
+
+    o3d.io.write_point_cloud(str(scene_dir / 'pc_voxel_down_color.ply'), voxel_down_pcd)
+
+    points = np.asarray(voxel_down_pcd.points)
+    logging.info("Scene Range")
+    log.info("Scene Range")
+    log.info("X  max {} min {} range {}".format(points[:, 0].max(), points[:, 0].min(),
+                                                points[:, 0].max() - points[:, 0].min()))
+    log.info("Y  max {} min {} range {}".format(points[:, 1].max(), points[:, 1].min(),
+                                                points[:, 1].max() - points[:, 1].min()))
+    log.info("Z  max {} min {} range {}".format(points[:, 2].max(), points[:, 2].min(),
+                                                points[:, 2].max() - points[:, 2].min()))
+    scene_voxels = points
+    scene_voxels_sem = voxel_sem[valid_point_mask]
+    ##############################
+    # generate frame occupancy
+    ##############################
+    if voxel_size == 0.08:
+        voxDim = np.asarray([60, 60, 36])  # 0.08 cm
+    elif voxel_size == 0.04:
+        voxDim = np.asarray([120, 120, 72])  # 0.08 cm
+    elif voxel_size == 0.02:
+        voxDim = np.asarray([240, 240, 144])  # 0.02 cm
+
+    assert np.all(voxDim * voxel_size == np.asarray([4.8, 4.8, 2.88]))
+    # [4.8,4.8,2.88]
+    voxOriginCam = np.asarray([
+        [0], [0], [1.44]]
+    )
+
+    files = input_color_dir.glob('*.jpg')
+    files = sorted(files, key=lambda x: int(x.stem.split('.')[0]))
+    for idx, file in tqdm(enumerate(files), total=len(files)):
+
+        # if idx == 0 or idx == 10 or idx == 199:
+        #     pass
+        # else:
+        #     continue
+
+        frame_key = file.stem
+
+        # 加载RGB图像
+        image = np.asarray(Image.open(str(input_color_dir / f'{frame_key}.jpg'))).astype(np.uint8)  #
+
+        # 加载相机内参
+        intrinsics = np.loadtxt(str(input_intrinsic_dir / f'{frame_key}.txt'))
+
+        # 加载深度图
+        depth = np.asarray(Image.open(str(input_depth_dir / f'{frame_key}.png'))).astype(np.float32) / 1000.
+
+        # 缩放深度图
+        h, w, _ = image.shape
+        depth = cv2.resize(depth, (w, h))
+
+        # 加载相机位姿
+        pose_file = input_pose_dir / f'{frame_key}.txt'
+        pose = np.loadtxt(str(pose_file))  # camera to world
+
+        cam2world = pose
+
+        voxOriginWorld = cam2world[:3, :3] @ voxOriginCam + cam2world[:3, -1:]
+        voxOriginWorld2 = deepcopy(voxOriginWorld)
+        delta = np.array(
+            [[2.4],
+             [2.4],
+             [1.44]]
+        )  # 世界坐标系下的
+        voxOriginWorld -= delta
+
+        # 保留距离原点4.8范围内的场景
+        scene_voxels_delta = np.abs(scene_voxels[:, :3] - voxOriginWorld.reshape(-1))
+        mask = np.logical_and(scene_voxels_delta[:, 0] <= 4.8,
+                              np.logical_and(scene_voxels_delta[:, 1] <= 4.8,
+                                             scene_voxels_delta[:, 2] <= 4.8))
+        frame_voxels = scene_voxels[mask]
+        frame_voxels_sem = scene_voxels_sem[mask]
+        # ================> debug
+        if vis_debug:
+            frame_pcd1 = o3d.geometry.PointCloud()
+            frame_voxels_xyz = np.vstack((frame_voxels,
+                                          voxOriginWorld.reshape(-1).reshape((1, 3)),
+                                          voxOriginWorld2.reshape(-1).reshape((1, 3)),
+
+                                          ))
+            frame_voxels_color = np.vstack((color_map[scene_voxels_sem[mask]],
+                                            [214, 38, 40],  # 红色
+                                            [43, 160, 43],  # 绿色
+                                            )
+                                           )
+            frame_pcd1.points = o3d.utility.Vector3dVector(frame_voxels_xyz)
+            frame_pcd1.colors = o3d.utility.Vector3dVector(frame_voxels_color / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}.ply'), frame_pcd1)
+        # <================ debug
+
+        # 世界坐标内画出场景的范围
+        xs = np.arange(voxOriginWorld[0, 0], voxOriginWorld[0, 0] + 100 * voxel_size, voxel_size)[:voxDim[0]]
+        ys = np.arange(voxOriginWorld[1, 0], voxOriginWorld[1, 0] + 100 * voxel_size, voxel_size)[:voxDim[1]]
+        zs = np.arange(voxOriginWorld[2, 0], voxOriginWorld[2, 0] + 100 * voxel_size, voxel_size)[:voxDim[2]]
+        gridPtsWorldX, gridPtsWorldY, gridPtsWorldZ = np.meshgrid(xs, ys, zs)
+        gridPtsWorld = np.stack([gridPtsWorldX.flatten(),
+                                 gridPtsWorldY.flatten(),
+                                 gridPtsWorldZ.flatten()], axis=1)
+        gridPtsLabel = np.zeros((gridPtsWorld.shape[0]))
+        gridPtsWorld_color = np.zeros((gridPtsWorld.shape[0], 3))
+
+        # ================> debug
+        if vis_debug:
+            frame_pcd_with_grid = o3d.geometry.PointCloud()
+            frame_voxels_with_grid_xyz = np.vstack((frame_voxels, gridPtsWorld))
+            frame_voxels_with_grid_color = np.vstack((color_map[scene_voxels_sem[mask]], gridPtsWorld_color))
+            frame_pcd_with_grid.points = o3d.utility.Vector3dVector(frame_voxels_with_grid_xyz)
+            frame_pcd_with_grid.colors = o3d.utility.Vector3dVector(frame_voxels_with_grid_color / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}_world.ply'), frame_pcd_with_grid)
+        # <================ debug
+        kdtree = KDTree(frame_voxels[:, :3], leaf_size=10)
+        dist, ind = kdtree.query(gridPtsWorld)  # 返回与gridPtsWorld最近的1个邻居。dist表示其距离，ind表示其索引
+        dist, ind = dist.reshape(-1), ind.reshape(-1)
+        mask = dist <= voxel_size  # 确保最近的邻居，在范围之内
+        gridPtsLabel[mask] = frame_voxels_sem[ind[mask]]  # 赋予语义标签
+
+        g = gridPtsLabel.reshape(voxDim[0], voxDim[1], voxDim[2])
+        g_not_0 = np.where(g > 0)  # 初始化是0
+        if len(g_not_0) == 0:
+            continue
+        g_not_0_x = g_not_0[0]
+        g_not_0_y = g_not_0[1]
+        if len(g_not_0_x) == 0:
+            continue
+        if len(g_not_0_y) == 0:
+            continue
+        valid_x_min = g_not_0_x.min()
+        valid_x_max = g_not_0_x.max()
+        valid_y_min = g_not_0_y.min()
+        valid_y_max = g_not_0_y.max()
+        mask = np.zeros_like(g)
+        if valid_x_min != valid_x_max and valid_y_min != valid_y_max:
+            mask[valid_x_min:valid_x_max, valid_y_min:valid_y_max, :] = 1
+            mask = 1 - mask  #
+            mask = mask.astype(np.bool_)
+            g[mask] = 255  # 在有效范围以外的区域, 将其label设置为255
+        else:
+            continue
+        frame_voxels = np.zeros((gridPtsWorld.shape[0], 4))
+        frame_voxels[:, :3] = gridPtsWorld
+        frame_voxels[:, -1] = g.reshape(-1)
+        # gridPtsWorld[:, -1] = g.reshape(-1)
+
+        # 计算3D点至2D图像的投影点
+        voxels_cam = (np.linalg.inv(cam2world)[:3, :3] @ gridPtsWorld[:, :3].T \
+                      + np.linalg.inv(cam2world)[:3, -1:]).T
+        voxels_pix = (intrinsics[:3, :3] @ voxels_cam.T).T
+        voxels_pix = voxels_pix / voxels_pix[:, -1:]
+        mask = np.logical_and(voxels_pix[:, 0] >= 0,
+                              np.logical_and(voxels_pix[:, 0] < w,
+                                             np.logical_and(voxels_pix[:, 1] >= 0,
+                                                            np.logical_and(voxels_pix[:, 1] < h,
+                                                                           voxels_cam[:, 2] > 0))))  # 视野内的
+        inroom = frame_voxels[:, -1] != 255
+        mask = np.logical_and(~mask, inroom)  # 如果一个3d point，它没有落在图像上，并且是在房间内，则将其label设置为0（empty）
+        frame_voxels[mask, -1] = 0  # empty类别
+
+        if vis_debug:
+            # 仅保存有效的语义
+            valid_frame_voxels = frame_voxels[np.logical_and(frame_voxels[:, -1] > 0, frame_voxels[:, -1] < 13)]
+            frame_pcd2 = o3d.geometry.PointCloud()
+            frame_pcd2.points = o3d.utility.Vector3dVector(valid_frame_voxels[:, :3])
+            frame_pcd2.colors = o3d.utility.Vector3dVector(color_map[valid_frame_voxels[:, -1].astype(int)] / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}_valid.ply'), frame_pcd2)
+
+            # 保留empty区域+语义区域
+            valid_frame_voxels = frame_voxels[frame_voxels[:, -1] < 13]
+            frame_pcd3 = o3d.geometry.PointCloud()
+            frame_pcd3.points = o3d.utility.Vector3dVector(valid_frame_voxels[:, :3])
+            frame_pcd3.colors = o3d.utility.Vector3dVector(color_map[valid_frame_voxels[:, -1].astype(int)] / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}_valid+empty.ply'), frame_pcd3)
+
+            # 保留unknown区域
+            unknown_frame_voxels = frame_voxels[frame_voxels[:, -1] == 255]
+            frame_pcd4 = o3d.geometry.PointCloud()
+            frame_pcd4.points = o3d.utility.Vector3dVector(unknown_frame_voxels[:, :3])
+            frame_pcd4.colors = o3d.utility.Vector3dVector(color_map[unknown_frame_voxels[:, -1].astype(int)] / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}_unknown.ply'), frame_pcd4)
+
+            # unknown+sem区域
+            unknown_sem_frame_voxels = frame_voxels[frame_voxels[:, -1] > 0]
+            # sem_frame_voxels = frame_voxels[np.logical_and(frame_voxels[:, -1] > 0, frame_voxels[:, -1] < 13)]
+            frame_pcd4 = o3d.geometry.PointCloud()
+            frame_pcd4.points = o3d.utility.Vector3dVector(unknown_sem_frame_voxels[:, :3])
+            frame_pcd4.colors = o3d.utility.Vector3dVector(color_map[unknown_sem_frame_voxels[:, -1].astype(int)] / 255)
+            o3d.io.write_point_cloud(str(output_dir / f'{frame_key}_unknown_sem.ply'), frame_pcd4)
+        #######
+        # TODO 根据条件过滤一些体素
+
+        ###### 保存
+        target_1_4 = frame_voxels[:, -1].reshape(60, 60, 36)
+
+        pkl_data = {
+            'img': str(input_color_dir / f'{frame_key}.jpg'),
+            'depth_gt': str(input_depth_dir / f'{frame_key}.png'),
+            'cam_pose': pose,  # camera to world
+            'intrinsic': intrinsics,
+            'target_1_4': target_1_4,
+            'voxel_origin': np.array([frame_voxels[:, 0].min(), frame_voxels[:, 1].min(), frame_voxels[:, 2].min()]),
+        }
+        with open(str(output_dir / f'{frame_key}.pkl'), "wb") as handle:
+            pickle.dump(pkl_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def arg_parser():
+    parser = argparse.ArgumentParser(
+        description=
+        'Project 3D points to 2D image plane and aggregate labels and save label txt'
+    )
+    parser.add_argument(
+        '--workspace',
+        type=str,
+        required=True,
+        help=
+        'Path to workspace directory. There should be a "color" folder inside.',
+    )
+    parser.add_argument(
+        '--input_mesh',
+        type=str,
+        default='point_lifted_mesh.ply',
+        help='Name of input mesh',
+    )
+    parser.add_argument(
+        '--input_label',
+        type=str,
+        default='labels.txt',
+        help='Name of input label for 3d mesh',
+    )  # 每个点的label
+    parser.add_argument(
+        '--output_global_occupancy',
+        type=str,
+        default='occupancy.ply',
+        help='Name of files to save the occupancy',
+    )
+
+    parser.add_argument(
+        '--label_space',
+        default='occ11'
+    )  # ['wordnet','occ11']
+
+    ############### 添加cad
+    parser.add_argument(
+        '--cad_object_label_file',
+        type=str,
+        default='intermediate/HOC_Search/CAD_retrieval/cad_object_label.txt',
+        help='Name of input label for 3d mesh',
+    )
+    parser.add_argument(
+        '--original_object_index_file',
+        type=str,
+        default='intermediate/HOC_Search/CAD_retrieval/original_object_index.txt',
+        help='Name of input label for 3d mesh',
+    )
+    parser.add_argument(
+        '--cad_retrieval_mesh',
+        type=str,
+        default='intermediate/HOC_Search/CAD_retrieval/cad_retrieval.ply',
+        help='Name of input label for 3d mesh',
+    )  #
+    ###############
+
+    parser.add_argument(
+        '--output_frame_folder',
+        default='preprocessed_voxels'
+    )
+
+    parser.add_argument(
+        '--config',
+        help='Name of config file'
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+    """
+        Convert scene mesh to scene occupancy
+    """
+
+    args = arg_parser()
+    if args.config is not None:
+        gin.parse_config_file(args.config)
+    main(
+        scene_dir=args.workspace,
+        input_label=args.input_label,
+        input_mesh=args.input_mesh,
+        output_global_occupancy=args.output_global_occupancy,
+        output_frame_folder=args.output_frame_folder,
+        label_space=args.label_space,
+        cad_object_label=args.cad_object_label_file,
+        original_object_index=args.original_object_index_file,
+        cad_retrieval_mesh=args.cad_retrieval_mesh,
+    )
